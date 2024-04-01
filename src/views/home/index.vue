@@ -1,20 +1,29 @@
 <template>
   <div class="home-page">
     <div class="local-video" :class="callStatus">
-      <video :ref="localVideoRef" class="video-el"></video>
+      <video ref="localVideoRef" class="video-el" autoplay playsinline></video>
     </div>
     <div v-if="callStatus === CallStatus.CONNECT" class="remote-video">
-      <video :ref="remoteVideoRef" class="video-el"></video>
+      <video ref="remoteVideoRef" class="video-el" autoplay playsinline></video>
     </div>
-    <div v-if="!scReady" class="loading-tip">连接中...</div>
+    <div v-if="!scReady" class="center-tip">连接中...</div>
     <template v-else>
-      <div v-if="callStatus === CallStatus.INIT" class="call-btn" @click="launchCallBefore">
+      <div
+        v-if="callStatus === CallStatus.INIT"
+        class="call-btn"
+        :class="{ disabled: !callReady }"
+        @click="launchCallBefore"
+      >
         发起通话
       </div>
-      <div v-else class="action-area">
+      <div v-if="callStatus === CallStatus.CALLING" class="center-tip">
+        {{ peerType === PeerType.LAUNCH ? '等待对方接听...' : '对方邀请您视频通话' }}
+      </div>
+      <div v-if="callStatus !== CallStatus.INIT" class="action-area">
         <div
           class="action-btn accept-btn"
           v-if="callStatus === CallStatus.CALLING && peerType === PeerType.RECEIVE"
+          @click="acceptCall"
         >
           ✔
         </div>
@@ -76,18 +85,18 @@ const initSignalingChannel = () => {
   });
   socket.on('call', async () => {
     callStatus.value = CallStatus.CALLING;
-    if (peerType.value === PeerType.LAUNCH) {
-      const offer = await peerConnection!.createOffer();
-      await peerConnection!.setLocalDescription(offer);
-      socket.emit('sendOffer', offer);
-    }
   });
   socket.on('stopCall', (_peerType: PeerType) => {
     if (_peerType !== peerType.value) {
       showMsg('对方挂断通话');
     }
-    callStatus.value = CallStatus.INIT;
-    peerType.value = PeerType.RECEIVE;
+    restoreCall();
+  });
+  socket.on('acceptCall', () => {
+    callStatus.value = CallStatus.CONNECT;
+    // 开启本地视频流
+    localVideoRef.value.srcObject = localMediaStream.value;
+    initPeerConnection();
   });
   socket.on('sendAnswer', async (answer: any) => {
     if (peerType.value === PeerType.LAUNCH) {
@@ -109,12 +118,20 @@ const initSignalingChannel = () => {
   socket.on('sendCandidate', async (candidate: any, _peerType: PeerType) => {
     if (peerType.value !== _peerType) {
       await peerConnection!.addIceCandidate(candidate);
-      console.log(`收到${_peerType}的candidate`);
+      console.log(`收到${_peerType}端的candidate`);
     }
   });
 };
 
+const callReady = computed(() => {
+  return localMediaStream.value;
+});
+
 const launchCallBefore = () => {
+  if (!callReady.value) {
+    showMsg('初始化失败，请刷新页面');
+    return;
+  }
   socket.emit('checkOnlineStatus');
 };
 const launchCall = () => {
@@ -124,24 +141,78 @@ const launchCall = () => {
 const stopCall = () => {
   socket.emit('stopCall', peerType.value);
 };
+const acceptCall = () => {
+  socket.emit('acceptCall');
+};
+const restoreCall = () => {
+  if (peerConnection) {
+    peerConnection!.close();
+    peerConnection = null;
+  }
+  localVideoRef.value && (localVideoRef.value.srcObject = null);
+  remoteVideoRef.value && (remoteVideoRef.value.srcObject = null);
+  callStatus.value = CallStatus.INIT;
+  peerType.value = PeerType.RECEIVE;
+};
+
+const localMediaStream = ref<MediaStream | null>(null);
+const initMediaStream = async () => {
+  const constraints = {
+    video: true,
+    audio: true
+  };
+  localMediaStream.value = await navigator.mediaDevices.getUserMedia(constraints);
+};
 
 let peerConnection: RTCPeerConnection | null = null;
+let remoteMediaStream: MediaStream | null = null;
 const initPeerConnection = async () => {
-  const configuration = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
-  peerConnection = new RTCPeerConnection(configuration);
+  // const configuration = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+  peerConnection = new RTCPeerConnection();
+  // 添加媒体流
+  if (localMediaStream.value) {
+    localMediaStream.value.getTracks().forEach((track) => {
+      peerConnection!.addTrack(track, localMediaStream.value!);
+    });
+  }
   peerConnection.addEventListener('icecandidate', (event) => {
-    console.log('!!!');
     if (event.candidate) {
       socket.emit('sendCandidate', event.candidate, peerType.value);
     }
   });
   peerConnection.addEventListener('connectionstatechange', (event) => {
-    console.log('connectionstatechange', event);
+    const connectionState = peerConnection!.connectionState;
+    if (connectionState === 'disconnected') {
+      showMsg('网络连接异常');
+      restoreCall();
+    }
   });
+  peerConnection.addEventListener('track', (event) => {
+    const [remoteStream] = event.streams;
+    remoteVideoRef.value.srcObject = remoteStream;
+    remoteMediaStream = remoteStream;
+  });
+  if (peerType.value === PeerType.LAUNCH) {
+    launchExchangeSDP();
+  }
 };
 
-initSignalingChannel();
-initPeerConnection();
+// 启动SDP交换流程 - 建立Peer连接第一步，后面流程通过事件回调推动
+const launchExchangeSDP = async () => {
+  const offer = await peerConnection!.createOffer({
+    offerToReceiveAudio: true,
+    offerToReceiveVideo: true
+  });
+  await peerConnection!.setLocalDescription(offer);
+  socket.emit('sendOffer', offer);
+};
+
+onMounted(() => {
+  initSignalingChannel();
+  initMediaStream().catch((err) => {
+    alert(err);
+  });
+});
 </script>
 
 <style lang="less" scoped>
@@ -195,9 +266,14 @@ initPeerConnection();
     color: #dddddd;
     font-weight: bold;
     box-shadow: 0px 0px 20px rgba(80, 200, 120, 0.5);
-    transition: transform 0.1s;
+    transition: all 0.1s;
     &:active {
       transform: translate(-50%, -50%) scale(0.95);
+    }
+    &.disabled {
+      background-color: #999999;
+      transform: translate(-50%, -50%);
+      box-shadow: none;
     }
   }
   .action-area {
@@ -234,7 +310,7 @@ initPeerConnection();
       }
     }
   }
-  .loading-tip {
+  .center-tip {
     position: absolute;
     top: 50%;
     left: 50%;
